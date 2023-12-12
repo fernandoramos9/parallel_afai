@@ -9,8 +9,8 @@ from PIL import Image
 import pyopencl as cl
 import unpackqa
 import time
-import graphviz
 import warnings
+
 #Ignoring opencl warnings
 warnings.filterwarnings('ignore')
 os.environ['PYOPENCL_CTX'] = '0'
@@ -19,9 +19,12 @@ ctx = cl.create_some_context()
 queue = cl.CommandQueue(ctx)
 mf = cl.mem_flags
 
+
+
 @delayed
 def get_image(src: str):
     np_image = np.array([open_image(img) for img in glob.glob(f"{src}/*B[456].TIF")])
+
     return np_image
 
 
@@ -44,7 +47,6 @@ def calculate_AFAI(img):
     buffers = [R_g, NIR_g]
     # Compile and execute kernel
 
-
     prg = cl.Program(ctx, """
     __kernel void afai(__global double *R_g,
                        __global const double *NIR_g,
@@ -56,7 +58,7 @@ def calculate_AFAI(img):
         R_g[gid] = NIR_g[gid] - (R_g[gid] + ((SWIR_g[gid] - R_g[gid]) * ratio));
         
     }
-    """).build()
+    """).build(options=['-cl-single-precision-constant', '-cl-mad-enable'])
 
     afai_knl = prg.afai
     afai_knl.set_args(R_g, NIR_g, SWIR_g, np.float64(lambda_ratio), np.int32(R.shape[1]))
@@ -66,7 +68,7 @@ def calculate_AFAI(img):
 
     return buffers, R.shape
 
-
+@delayed
 def get_mask(src: str):
     mask_arr = open_image(glob.glob(f"{src}/*PIXEL.TIF")[0])
     mask = unpackqa.unpack_to_array(mask_arr,
@@ -77,6 +79,7 @@ def get_mask(src: str):
 
 @delayed
 def no_observation_class(buffers, mask):
+
     # Memory allocation
     buffers, size = buffers
     AFAI = buffers[0]
@@ -93,7 +96,7 @@ def no_observation_class(buffers, mask):
             AFAI[gid] = AFAI[gid] * mask_g[gid];
 
         }
-        """).build(options="-cl-fast-relaxed-math")
+        """).build(options=['-cl-single-precision-constant', '-cl-mad-enable'])
     # result_g = cl.Buffer(ctx, mf.WRITE_ONLY, AFAI.nbytes)
     noc_knl = prg.no_observation
     noc_knl.set_args(AFAI, mask_g, np.int32(size[1]))
@@ -102,15 +105,16 @@ def no_observation_class(buffers, mask):
     no_observation = np.empty_like(mask)
     cl.enqueue_copy(queue, no_observation, AFAI)
 
-    AFAI.release()
+    #AFAI.release()
     mask_g.release()
-    return no_observation
+    return no_observation, AFAI
 
 
 @delayed
 def normalize_image(img):
-
-    img_g = cl.Buffer(ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=img)
+    img, buffer = img
+    cl.enqueue_copy(queue, buffer, img).wait()
+    #img_g = cl.Buffer(ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=img)
 
     prg = cl.Program(ctx, """
             __kernel void normalize(__global double *img_g,
@@ -122,15 +126,15 @@ def normalize_image(img):
                 img_g[gid] = 1 - ((img_g[gid] - min)  / (max - min));
 
             }
-            """).build()
+            """).build(options=['-cl-single-precision-constant', '-cl-mad-enable'])
     norm_knl = prg.normalize
-    norm_knl.set_args(img_g, np.int32(img.shape[1]), np.min(img), np.max(img))
+    norm_knl.set_args(buffer, np.int32(img.shape[1]), np.min(img), np.max(img))
     cl.enqueue_nd_range_kernel(queue, norm_knl, img.shape, None)
 
     normalized_img = np.empty_like(img)
 
-    cl.enqueue_copy(queue, normalized_img, img_g)
-    img_g.release()
+    cl.enqueue_copy(queue, normalized_img, buffer)
+    buffer.release()
     return normalized_img
 
 
@@ -140,9 +144,9 @@ def save_image(img, src):
 
 
 def main(argv):
-
     path = argv
     start_time = time.time()
+
     image_list = [get_image(os.path.join(path, folder)) for folder in os.listdir(path)]
     AFAI_list = [calculate_AFAI(img) for img in image_list]
     mask_list = [get_mask(os.path.join(path, folder)) for folder in os.listdir(path)]
@@ -151,11 +155,8 @@ def main(argv):
     save = [save_image(img, src) for img, src in zip(normalized_list, os.listdir(path))]
 
     dask.compute(*save)
-
-    #dask.visualize(*save)
     end_time = time.time()
     print(f'GPU: {end_time - start_time}')
-
 
 if __name__ == '__main__':
     main(sys.argv[1])
