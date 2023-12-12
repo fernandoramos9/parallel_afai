@@ -11,14 +11,13 @@ import unpackqa
 import time
 import warnings
 
-#Ignoring opencl warnings
+# Ignoring opencl warnings
 warnings.filterwarnings('ignore')
 os.environ['PYOPENCL_CTX'] = '0'
 
 ctx = cl.create_some_context()
 queue = cl.CommandQueue(ctx)
 mf = cl.mem_flags
-
 
 
 @delayed
@@ -43,7 +42,7 @@ def calculate_AFAI(img):
     NIR_g = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=NIR)
     SWIR_g = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=SWIR)
 
-    #List of buffers to reuse later
+    # List of buffers to reuse later
     buffers = [R_g, NIR_g]
     # Compile and execute kernel
 
@@ -68,23 +67,22 @@ def calculate_AFAI(img):
 
     return buffers, R.shape
 
+
 @delayed
 def get_mask(src: str):
     mask_arr = open_image(glob.glob(f"{src}/*PIXEL.TIF")[0])
     mask = unpackqa.unpack_to_array(mask_arr,
                                     product='LANDSAT_8_C2_L2_QAPixel',
                                     flags=['Water'])
-    return mask.astype('uint16')
+    return mask.astype(np.float64)
 
 
 @delayed
 def no_observation_class(buffers, mask):
-
     # Memory allocation
     buffers, size = buffers
     AFAI = buffers[0]
     mask_g = buffers[1]
-    mask = mask.astype(np.float64)
     cl.enqueue_copy(queue, mask_g, mask).wait()
 
     prg = cl.Program(ctx, """
@@ -105,7 +103,7 @@ def no_observation_class(buffers, mask):
     no_observation = np.empty_like(mask)
     cl.enqueue_copy(queue, no_observation, AFAI)
 
-    #AFAI.release()
+    # AFAI.release()
     mask_g.release()
     return no_observation, AFAI
 
@@ -114,8 +112,6 @@ def no_observation_class(buffers, mask):
 def normalize_image(img):
     img, buffer = img
     cl.enqueue_copy(queue, buffer, img).wait()
-    #img_g = cl.Buffer(ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=img)
-
     prg = cl.Program(ctx, """
             __kernel void normalize(__global double *img_g,
                                     const int cols,
@@ -158,5 +154,7 @@ def main(argv):
     end_time = time.time()
     print(f'GPU: {end_time - start_time}')
 
+
 if __name__ == '__main__':
+    dask.config.set(scheduler='threads')
     main(sys.argv[1])
